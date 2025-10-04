@@ -1,4 +1,0 @@
-requests
-apscheduler
-flask
-python-dotenv
