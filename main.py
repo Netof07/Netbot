@@ -36,7 +36,7 @@ def get_usdt_pairs():
         return usdt_pairs
     except Exception as e:
         print(f"USDT çiftleri alınamadı: {e}")
-        return ['LAUSDT', 'CHRUSDT']  # Varsayılan sorunlu çiftler
+        return []
 
 def get_volume_change(symbol, interval):
     """Mevcut ve önceki mumun hacmini al, % değişimi hesapla."""
@@ -76,29 +76,34 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Telegram mesajı gönderilemedi: {e}")
 
-def check_volumes():
-    """Hacimleri kontrol et ve 5 kat artışları bildir."""
+def check_volumes_4h():
+    """4 saatlik mumlar için hacim kontrolü."""
     tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
-    print(f"Tarama başlıyor (TR): {tr_time}")
-    message = f"<b>Binance 5x Hacim Artışları (TR Saat: {tr_time}):</b>\n"
+    print(f"4h tarama başlıyor (TR): {tr_time}")
+    message = f"<b>Binance 5x Hacim Artışları (4h, TR Saat: {tr_time}):</b>\n"
     usdt_pairs = get_usdt_pairs()
     found = False
 
-    # Öncelikli çiftler: LAUSDT ve CHRUSDT
-    priority_pairs = ['LAUSDT', 'CHRUSDT']
-    for symbol in priority_pairs:
-        if symbol in usdt_pairs:
-            usdt_pairs.remove(symbol)
-            usdt_pairs.insert(0, symbol)
-
-    for symbol in usdt_pairs[:50]:  # İlk 50 çifti tara (rate limit için)
-        # 4 saatlik değişim
+    for symbol in usdt_pairs[:100]:  # İlk 100 çifti tara (rate limit için)
         change_4h = get_volume_change(symbol, '4h')
         if change_4h is not None and change_4h >= THRESHOLD:
             message += f"{symbol} 4s: {change_4h:.2f}% artış\n"
             found = True
-        
-        # 1 günlük değişim
+    
+    if found:
+        send_telegram_message(message)
+    else:
+        send_telegram_message("Bu saatte 4h için 5x hacim artışı yok.")
+
+def check_volumes_1d():
+    """1 günlük mumlar için hacim kontrolü."""
+    tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
+    print(f"1d tarama başlıyor (TR): {tr_time}")
+    message = f"<b>Binance 5x Hacim Artışları (1d, TR Saat: {tr_time}):</b>\n"
+    usdt_pairs = get_usdt_pairs()
+    found = False
+
+    for symbol in usdt_pairs[:100]:  # İlk 100 çifti tara (rate limit için)
         change_1d = get_volume_change(symbol, '1d')
         if change_1d is not None and change_1d >= THRESHOLD:
             message += f"{symbol} 1g: {change_1d:.2f}% artış\n"
@@ -107,15 +112,16 @@ def check_volumes():
     if found:
         send_telegram_message(message)
     else:
-        send_telegram_message("Bu saatte 5x hacim artışı yok.")
+        send_telegram_message("Bu saatte 1d için 5x hacim artışı yok.")
 
-# Zamanlayıcı ayarı (4 saatlik mum kapanışlarından 5 dakika sonra, TR saatiyle)
+# Zamanlayıcı ayarı (4 saatlik ve günlük mum kapanışlarından 5 dakika sonra)
 scheduler = BackgroundScheduler()
-scheduler.add_job(check_volumes, 'cron', minute=5, hour='*/4')  # UTC: 00:05, 04:05, 08:05; TR: 03:05, 07:05, 11:05
+scheduler.add_job(check_volumes_4h, 'cron', minute=5, hour='*/4')  # 4h: TR 03:05, 07:05, 11:05, 15:05, 19:05, 23:05
+scheduler.add_job(check_volumes_1d, 'cron', minute=5, hour=0)      # 1d: TR 03:05
 scheduler.start()
 
 # Flask uygulamasını başlat
 if __name__ == '__main__':
     print("Bot başlatıldı. Render Web Service olarak çalışıyor.")
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port) 
+    app.run(host='0.0.0.0', port=port)
