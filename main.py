@@ -89,4 +89,41 @@ def check_volumes_4h():
     for symbol in usdt_pairs:  # Tüm USDT çiftlerini tara
         change_4h = get_volume_change(symbol, '4h')
         if change_4h is not None and change_4h >= THRESHOLD:
-            message += f"{symbol} 4s: {change_4h:.2f}% artış
+            message += f"{symbol} 4s: {change_4h:.2f}% artış\n"
+            found = True
+    
+    if found:
+        send_telegram_message(message)
+    else:
+        send_telegram_message("Bu saatte 4h için 5x hacim artışı yok.")
+
+def check_volumes_1d():
+    """1 günlük mumlar için hacim kontrolü."""
+    tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
+    print(f"1d tarama başlıyor (TR): {tr_time}")
+    message = f"<b>Binance 5x Hacim Artışları (1d, TR Saat: {tr_time}):</b>\n"
+    usdt_pairs = get_usdt_pairs()
+    found = False
+
+    for symbol in usdt_pairs:  # Tüm USDT çiftlerini tara
+        change_1d = get_volume_change(symbol, '1d')
+        if change_1d is not None and change_1d >= THRESHOLD:
+            message += f"{symbol} 1g: {change_1d:.2f}% artış\n"
+            found = True
+    
+    if found:
+        send_telegram_message(message)
+    else:
+        send_telegram_message("Bu saatte 1d için 5x hacim artışı yok.")
+
+# Zamanlayıcı ayarı (4 saatlik ve günlük mum kapanışlarından 5 dakika sonra)
+scheduler = BackgroundScheduler()
+scheduler.add_job(check_volumes_4h, 'cron', minute=5, hour='*/4')  # 4h: TR 03:05, 07:05, 11:05, 15:05, 19:05, 23:05
+scheduler.add_job(check_volumes_1d, 'cron', minute=5, hour=0)      # 1d: TR 03:05
+scheduler.start()
+
+# Flask uygulamasını başlat
+if __name__ == '__main__':
+    print("Bot başlatıldı. Render Web Service olarak çalışıyor.")
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
