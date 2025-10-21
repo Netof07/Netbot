@@ -5,8 +5,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
@@ -51,16 +50,22 @@ def get_volume_change(symbol, interval):
         prev_volume = float(klines[0][5])
         current_volume = float(klines[1][5])
         current_close_time = int(klines[1][6]) / 1000
-        tr_time = datetime.fromtimestamp(current_close_time, tz=pytz.UTC).astimezone(pytz.timezone('Europe/Istanbul'))
-        now_tr = datetime.now(pytz.timezone('Europe/Istanbul'))
+        # UTC timestamp'i TR saati (+3 saat) yap
+        utc_time = datetime.fromtimestamp(current_close_time, tz=timezone.utc)
+        tr_time = utc_time + timedelta(hours=3)
+        now_utc = datetime.now(timezone.utc)
+        now_tr = now_utc + timedelta(hours=3)
+        # Mum kapanışının yeni olup olmadığını kontrol et (son 10 dk)
         if (now_tr - tr_time).total_seconds() > 600:
             print(f"{symbol} ({interval}): Mum eski ({tr_time}), atlanıyor.")
             return None
         if prev_volume == 0:
             print(f"{symbol} ({interval}): Önceki hacim sıfır.")
             return None
-        if prev_volume * float(klines[0][4]) < MIN_VOLUME_USDT:
-            print(f"{symbol} ({interval}): Düşük hacim ({prev_volume * float(klines[0][4]):.2f} USDT).")
+        # Min hacim kontrolü (önceki mum hacmi * kapanış fiyatı)
+        prev_close_price = float(klines[0][4])
+        if prev_volume * prev_close_price < MIN_VOLUME_USDT:
+            print(f"{symbol} ({interval}): Düşük hacim ({prev_volume * prev_close_price:.2f} USDT).")
             return None
         change = ((current_volume - prev_volume) / prev_volume) * 100
         print(f"{symbol} ({interval}): {change:.2f}% artış, Kapanış={tr_time}")
@@ -107,7 +112,10 @@ def check_volumes_4h():
         send_telegram_message(message)
     else:
         send_telegram_message("Bu saatte 4h için 5x hacim artışı yok.")
-    send_telegram_message(f"<b>4h Debug Log (ilk 10):</b>\n" + "\n".join(debug_log[:10]) + f"\nToplam taranan: {len(usdt_pairs)}")
+    # Debug log'u kısaltarak gönder (tüm sembolleri değil, örnekleri)
+    if debug_log:
+        sample_log = debug_log[:10]  # İlk 10'u al
+        send_telegram_message(f"<b>4h Debug Log (örnek):</b>\n" + "\n".join(sample_log) + f"\nToplam taranan: {len(usdt_pairs)}")
 
 def check_volumes_1d():
     tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
@@ -134,7 +142,10 @@ def check_volumes_1d():
         send_telegram_message(message)
     else:
         send_telegram_message("Bu saatte 1d için 5x hacim artışı yok.")
-    send_telegram_message(f"<b>1d Debug Log (ilk 10):</b>\n" + "\n".join(debug_log[:10]) + f"\nToplam taranan: {len(usdt_pairs)}")
+    # Debug log'u kısaltarak gönder
+    if debug_log:
+        sample_log = debug_log[:10]  # İlk 10'u al
+        send_telegram_message(f"<b>1d Debug Log (örnek):</b>\n" + "\n".join(sample_log) + f"\nToplam taranan: {len(usdt_pairs)}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(check_volumes_4h, 'cron', minute=5, hour='*/4')
