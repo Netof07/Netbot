@@ -5,11 +5,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from datetime import datetime
+import pytz
 
-# Flask uygulaması
 app = Flask(__name__)
 
-# Render için health endpoint
 @app.route('/health')
 def health():
     return 'Bot alive!', 200
@@ -18,56 +18,60 @@ def health():
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '8411864218:AAG3cUnGDyw8UXa7GZkcEY6XXZHWHUmnXPo')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '795151448')
 THRESHOLD = 500  # %500 artış
+MIN_VOLUME_USDT = 10000  # Min hacim filtresi
 BINANCE_API_URL = 'https://api.binance.com'
 
-# Requests için retry ayarı
 session = requests.Session()
 retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_usdt_pairs():
-    """USDT ile işlem gören çiftleri al."""
     try:
         response = session.get(f'{BINANCE_API_URL}/api/v3/exchangeInfo', timeout=15)
         response.raise_for_status()
         exchange_info = response.json()
-        usdt_pairs = [symbol['symbol'] for symbol in exchange_info['symbols'] if symbol['symbol'].endswith('USDT')]
+        usdt_pairs = [s['symbol'] for s in exchange_info['symbols'] if s['symbol'].endswith('USDT') and s['status'] == 'TRADING']
         print(f"Toplam {len(usdt_pairs)} USDT çifti bulundu. İlk 5: {usdt_pairs[:5]}...")
+        print(f"BIOUSDT mevcut: {'BIOUSDT' in usdt_pairs}")
+        print(f"FLOKIUSDT mevcut: {'FLOKIUSDT' in usdt_pairs}")
         return usdt_pairs
     except Exception as e:
         print(f"USDT çiftleri alınamadı: {e}")
         return []
 
 def get_volume_change(symbol, interval):
-    """Mevcut ve önceki mumun hacmini al, % değişimi hesapla."""
     try:
         params = {'symbol': symbol, 'interval': interval, 'limit': 2}
         response = session.get(f'{BINANCE_API_URL}/api/v3/klines', params=params, timeout=15)
         response.raise_for_status()
         klines = response.json()
         if len(klines) < 2:
-            print(f"{symbol} ({interval}): Yetersiz mum verisi (sadece {len(klines)} mum).")
+            print(f"{symbol} ({interval}): Yetersiz mum verisi.")
             return None
-        prev_volume = float(klines[0][5])  # Önceki mum hacmi (indeks 5)
-        current_volume = float(klines[1][5])  # Mevcut mum hacmi (indeks 5)
-        prev_close_time = int(klines[0][6]) / 1000  # Önceki mum kapanış (saniye)
-        current_close_time = int(klines[1][6]) / 1000  # Mevcut mum kapanış
+        prev_volume = float(klines[0][5])
+        current_volume = float(klines[1][5])
+        current_close_time = int(klines[1][6]) / 1000
+        tr_time = datetime.fromtimestamp(current_close_time, tz=pytz.UTC).astimezone(pytz.timezone('Europe/Istanbul'))
+        now_tr = datetime.now(pytz.timezone('Europe/Istanbul'))
+        if (now_tr - tr_time).total_seconds() > 600:
+            print(f"{symbol} ({interval}): Mum eski ({tr_time}), atlanıyor.")
+            return None
         if prev_volume == 0:
-            print(f"{symbol} ({interval}): Önceki hacim sıfır ({prev_volume}), hesaplama yapılamadı.")
+            print(f"{symbol} ({interval}): Önceki hacim sıfır.")
+            return None
+        if prev_volume * float(klines[0][4]) < MIN_VOLUME_USDT:
+            print(f"{symbol} ({interval}): Düşük hacim ({prev_volume * float(klines[0][4]):.2f} USDT).")
             return None
         change = ((current_volume - prev_volume) / prev_volume) * 100
-        tr_time = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(current_close_time + 3*3600))  # TR +3 saat
-        print(f"{symbol} ({interval}): Önceki hacim={prev_volume:.2f}, Mevcut hacim={current_volume:.2f}, "
-              f"Değişim={change:.2f}%, TR kapanış={tr_time}")
+        print(f"{symbol} ({interval}): {change:.2f}% artış, Kapanış={tr_time}")
         return change if change > 0 else None
     except Exception as e:
         print(f"Hata {symbol} ({interval}): {e}")
         return None
     finally:
-        time.sleep(0.5)  # Rate limit için bekleme
+        time.sleep(0.5)
 
 def send_telegram_message(message):
-    """Telegram botuna mesaj gönder."""
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         params = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -79,50 +83,64 @@ def send_telegram_message(message):
         print(f"Telegram mesajı gönderilemedi: {e}")
 
 def check_volumes_4h():
-    """4 saatlik mumlar için hacim kontrolü."""
     tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
     print(f"4h tarama başlıyor (TR): {tr_time}")
     message = f"<b>Binance 5x Hacim Artışları (4h, TR Saat: {tr_time}):</b>\n"
     usdt_pairs = get_usdt_pairs()
     found = False
+    debug_log = []
 
-    for symbol in usdt_pairs:  # Tüm USDT çiftlerini tara
+    for symbol in usdt_pairs:
         change_4h = get_volume_change(symbol, '4h')
-        if change_4h is not None and change_4h >= THRESHOLD:
+        if change_4h is None:
+            debug_log.append(f"{symbol}: Veri yok veya sıfır hacim")
+        elif change_4h >= THRESHOLD:
             message += f"{symbol} 4s: {change_4h:.2f}% artış\n"
             found = True
-    
+            debug_log.append(f"{symbol}: {change_4h:.2f}% (YAKALANDI)")
+        else:
+            debug_log.append(f"{symbol}: {change_4h:.2f}% (eşik altında)")
+        if symbol in ['BIOUSDT', 'FLOKIUSDT']:
+            print(f"Özel log: {symbol} 4h: {change_4h}%")
+
     if found:
         send_telegram_message(message)
     else:
         send_telegram_message("Bu saatte 4h için 5x hacim artışı yok.")
+    send_telegram_message(f"<b>4h Debug Log (ilk 10):</b>\n" + "\n".join(debug_log[:10]) + f"\nToplam taranan: {len(usdt_pairs)}")
 
 def check_volumes_1d():
-    """1 günlük mumlar için hacim kontrolü."""
     tr_time = time.strftime('%H:%M %d-%m-%Y', time.localtime(time.time() + 3*3600))
     print(f"1d tarama başlıyor (TR): {tr_time}")
     message = f"<b>Binance 5x Hacim Artışları (1d, TR Saat: {tr_time}):</b>\n"
     usdt_pairs = get_usdt_pairs()
     found = False
+    debug_log = []
 
-    for symbol in usdt_pairs:  # Tüm USDT çiftlerini tara
+    for symbol in usdt_pairs:
         change_1d = get_volume_change(symbol, '1d')
-        if change_1d is not None and change_1d >= THRESHOLD:
+        if change_1d is None:
+            debug_log.append(f"{symbol}: Veri yok veya sıfır hacim")
+        elif change_1d >= THRESHOLD:
             message += f"{symbol} 1g: {change_1d:.2f}% artış\n"
             found = True
-    
+            debug_log.append(f"{symbol}: {change_1d:.2f}% (YAKALANDI)")
+        else:
+            debug_log.append(f"{symbol}: {change_1d:.2f}% (eşik altında)")
+        if symbol in ['BIOUSDT', 'FLOKIUSDT']:
+            print(f"Özel log: {symbol} 1d: {change_1d}%")
+
     if found:
         send_telegram_message(message)
     else:
         send_telegram_message("Bu saatte 1d için 5x hacim artışı yok.")
+    send_telegram_message(f"<b>1d Debug Log (ilk 10):</b>\n" + "\n".join(debug_log[:10]) + f"\nToplam taranan: {len(usdt_pairs)}")
 
-# Zamanlayıcı ayarı (4 saatlik ve günlük mum kapanışlarından 5 dakika sonra)
 scheduler = BackgroundScheduler()
-scheduler.add_job(check_volumes_4h, 'cron', minute=5, hour='*/4')  # 4h: TR 03:05, 07:05, 11:05, 15:05, 19:05, 23:05
-scheduler.add_job(check_volumes_1d, 'cron', minute=5, hour=0)      # 1d: TR 03:05
+scheduler.add_job(check_volumes_4h, 'cron', minute=5, hour='*/4')
+scheduler.add_job(check_volumes_1d, 'cron', minute=5, hour=0)
 scheduler.start()
 
-# Flask uygulamasını başlat
 if __name__ == '__main__':
     print("Bot başlatıldı. Render Web Service olarak çalışıyor.")
     port = int(os.environ.get('PORT', 10000))
