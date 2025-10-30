@@ -7,7 +7,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 from flask import Flask
-from keepalive import start_keepalive_thread
 
 # .env yükle
 load_dotenv()
@@ -21,13 +20,15 @@ REQUEST_SLEEP = float(os.getenv('REQUEST_SLEEP', '0.5'))       # Rate limit içi
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 if not TG_TOKEN or not TG_CHAT_ID:
-    raise SystemExit('TG_TOKEN ve TG_CHAT_ID .env dosyasında veya ortam değişkenlerinde olmalı!')
+    logging.basicConfig(level='ERROR', format='%(asctime)s [%(levelname)s] %(message)s')
+    logging.error('TG_TOKEN ve TG_CHAT_ID eksik! Render Environment Variables\'a ekle.')
+    raise SystemExit('❌ TG_TOKEN ve TG_CHAT_ID gereklidir.')
 
 # Logging
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger('netbot')
 
-# Flask App (Render Web Service için)
+# Flask App (Tek app, Render için)
 app = Flask(__name__)
 
 @app.route('/health')
@@ -36,6 +37,9 @@ def health():
 
 # Telegram gönder
 def telegram_send(text):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logger.warning('Telegram ayarları eksik, mesaj atılamadı.')
+        return None
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         resp = requests.post(
@@ -43,6 +47,9 @@ def telegram_send(text):
             json={'chat_id': TG_CHAT_ID, 'text': text, 'parse_mode': 'HTML'},
             timeout=15
         )
+        if resp.status_code == 401:
+            logger.error('Telegram 401: Token hatalı! Render Environment\'a TG_TOKEN ekle.')
+            return None
         if resp.status_code != 200:
             logger.warning('Telegram hatası: %s %s', resp.status_code, resp.text)
         return resp.json()
@@ -137,12 +144,12 @@ def job():
             msg += f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x (+{a['price_change']:.1f}% fiyat)\n"
         telegram_send(msg)
     else:
-        telegram_send(f"<b>{'4h & 1d'}:</b> {VOLUME_MULTIPLIER}x+ artış yok.")
+        telegram_send(f"<b>4h & 1d:</b> {VOLUME_MULTIPLIER}x+ artış yok.")
 
 # Scheduler başlat
 def start_scheduler():
     scheduler = BackgroundScheduler()
-    # 4h: UTC 00:05, 04:05, 08:05, ... → TR 03:05, 07:05, ...
+    # 4h: UTC 00:05, 04:05, ... → TR 03:05, 07:05
     scheduler.add_job(job, CronTrigger(minute=5, hour='0,4,8,12,16,20'), id='job_4h')
     # 1d: UTC 00:05 → TR 03:05
     scheduler.add_job(job, CronTrigger(minute=5, hour=0), id='job_1d')
@@ -151,10 +158,9 @@ def start_scheduler():
 
 # Ana başlatma
 if __name__ == '__main__':
-    start_keepalive_thread()  # Render spin down'u önle
-    telegram_send('Bot başlatıldı! Cron tarama aktif.')
+    telegram_send('✅ Bot başlatıldı! Cron tarama aktif.')
     start_scheduler()
 
-    # Flask ile web servisi (Render için zorunlu)
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # Flask ile web servisi (Render için)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
