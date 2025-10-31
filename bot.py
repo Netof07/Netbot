@@ -16,7 +16,7 @@ TG_TOKEN = os.getenv('TG_TOKEN')
 TG_CHAT_ID = os.getenv('TG_CHAT_ID')
 BASE_URL = os.getenv('BASE_URL', 'https://api.binance.com/api/v3')
 VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', '5'))  # 5x
-REQUEST_SLEEP = float(os.getenv('REQUEST_SLEEP', '0.5'))
+REQUEST_SLEEP = float(os.getenv('REQUEST_SLEEP', '0.1'))       # Hızlı tarama
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
 if not TG_TOKEN or not TG_CHAT_ID:
@@ -33,7 +33,7 @@ app = Flask(__name__)
 
 @app.route('/health')
 def health():
-    return 'Bot alive! 05. dakikada tarama aktif', 200
+    return 'Bot alive! Güncel mum spike + 200 pair', 200
 
 # Telegram gönder
 def telegram_send(text):
@@ -49,7 +49,7 @@ def telegram_send(text):
         logger.exception('Telegram hatası: %s', e)
         return None
 
-# USDT çiftlerini al
+# USDT çiftlerini al → Sadece yüksek hacimli 200 (alfabetik)
 def get_active_usdt_symbols():
     url = f"{BASE_URL}/exchangeInfo"
     try:
@@ -57,14 +57,16 @@ def get_active_usdt_symbols():
         r.raise_for_status()
         symbols = [s['symbol'] for s in r.json().get('symbols', [])
                    if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING']
-        logger.info(f"{len(symbols)} USDT çifti bulundu.")
-        return symbols
+        symbols.sort()  # Alfabetik sıralama
+        high_volume = symbols[:200]  # İlk 200 (en aktifler)
+        logger.info(f"{len(high_volume)} USDT çifti taranıyor (yüksek hacimli ilk 200).")
+        return high_volume
     except Exception as e:
         logger.exception('exchangeInfo hatası: %s', e)
         return []
 
-# Hacim kontrolü
-def check_interval_for_symbol(symbol, interval):
+# GÜNCEL MUM vs. BİR ÖNCEKİ KAPANAN MUM (5x+ yakala)
+def check_current_vs_previous_mum(symbol, interval):
     url = f"{BASE_URL}/klines?symbol={symbol}&interval={interval}&limit=2"
     try:
         r = requests.get(url, timeout=10)
@@ -73,32 +75,29 @@ def check_interval_for_symbol(symbol, interval):
         if len(data) < 2:
             return None
 
+        # Bir önceki KAPANAN mum
         prev_vol = float(data[0][5])
-        last_vol = float(data[1][5])
-        prev_close = float(data[0][4])
-        last_close = float(data[1][4])
-        close_time_utc = datetime.fromtimestamp(int(data[1][6]) / 1000, tz=timezone.utc)
-        tr_time = close_time_utc + timedelta(hours=3)
+        prev_close_time = datetime.fromtimestamp(int(data[0][6]) / 1000, tz=timezone.utc)
+        prev_tr_time = prev_close_time + timedelta(hours=3)
+
+        # Şu anki (KAPANMAMIŞ) mum
+        current_vol = float(data[1][5])
+        current_close_time = datetime.fromtimestamp(int(data[1][6]) / 1000, tz=timezone.utc)
+        current_tr_time = current_close_time + timedelta(hours=3)
 
         if prev_vol <= 0:
             return None
 
-        ratio = last_vol / prev_vol
-        price_change = ((last_close - prev_close) / prev_close) * 100 if prev_close > 0 else 0
-
-        # KDAUSDT için özel log
-        if symbol == 'KDAUSDT':
-            logger.info("KDAUSDT %s: %.2fx hacim, %+.2f%% fiyat (Kapanış: %s TR)",
-                        interval, ratio, price_change, tr_time.strftime('%H:%M %d.%m'))
+        ratio = current_vol / prev_vol
 
         return {
             'symbol': symbol,
             'interval': interval,
             'ratio': ratio,
             'prev_vol': prev_vol,
-            'last_vol': last_vol,
-            'price_change': price_change,
-            'tr_time': tr_time.strftime('%H:%M %d.%m')
+            'current_vol': current_vol,
+            'prev_tr_time': prev_tr_time.strftime('%H:%M %d.%m'),
+            'current_tr_time': current_tr_time.strftime('%H:%M %d.%m')
         }
     except Exception as e:
         logger.debug('Hata %s %s: %s', symbol, interval, e)
@@ -106,48 +105,49 @@ def check_interval_for_symbol(symbol, interval):
     finally:
         time.sleep(REQUEST_SLEEP)
 
-# HER SAATİN 5. DAKİKASINDA TARAMA
+# TARAMA (Her saat :05 → Güncel mum spike)
 def job():
     tr_time = datetime.now(timezone.utc) + timedelta(hours=3)
-    logger.info(f"Tarama başladı: {tr_time.strftime('%H:%M %d.%m.%Y')} TR (her saat :05)")
-    
+    logger.info(f"Tarama başladı: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
+
     symbols = get_active_usdt_symbols()
     alerts = []
     debug_msgs = []
 
     for symbol in symbols:
         for interval in ('4h', '1d'):
-            res = check_interval_for_symbol(symbol, interval)
+            res = check_current_vs_previous_mum(symbol, interval)
             if res:
                 if res['ratio'] >= VOLUME_MULTIPLIER:
                     alerts.append(res)
-                elif res['ratio'] > 2:
-                    debug_msgs.append(f"{symbol} {interval}: {res['ratio']:.2f}x")
+                elif res['ratio'] > 1.5:
+                    debug_msgs.append(f"{symbol} {interval}: {res['ratio']:.2f}x (güncel)")
 
-    # Debug (2x+)
+    # Debug (1.5x+ güncel mum)
     if debug_msgs:
-        telegram_send(f"<b>Debug (2x+):</b>\n" + "\n".join(debug_msgs[:10]))
+        telegram_send(f"<b>Debug (1.5x+ güncel):</b>\n" + "\n".join(debug_msgs[:15]))
 
-    # Uyarı
+    # Uyarı (5x+ güncel mum)
     if alerts:
-        msg = f"<b>{VOLUME_MULTIPLIER}x+ Hacim Artışı!</b>\n"
+        msg = f"<b>{VOLUME_MULTIPLIER}x+ GÜNCEL MUM ARTIŞI!</b>\n"
         for a in alerts:
-            msg += f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x (+{a['price_change']:.1f}%)\n"
+            msg += (f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x\n"
+                    f"  Önceki: {a['prev_vol']:,.0f} | Güncel: {a['current_vol']:,.0f}\n"
+                    f"  Kapanış: {a['current_tr_time']} TR\n")
         telegram_send(msg)
     else:
-        telegram_send(f"<b>{tr_time.strftime('%H:%M')} TR:</b> 5x+ artış yok.")
+        telegram_send(f"<b>{tr_time.strftime('%H:%M')} TR:</b> 5x+ güncel artış yok.")
 
-# Scheduler
+# Scheduler (Her saat :05)
 def start_scheduler():
     scheduler = BackgroundScheduler()
-    # HER SAATİN 5. DAKİKASI (00:05, 01:05, 02:05, ...)
     scheduler.add_job(job, CronTrigger(minute=5), id='scan_05')
     scheduler.start()
-    logger.info('Scheduler başladı: Her saat :05 TR\'de tarama aktif.')
+    logger.info('Scheduler başladı: Her saat :05 TR\'de güncel mum tarama aktif.')
 
 # Ana
 if __name__ == '__main__':
-    telegram_send('Bot başlatıldı! Her saat :05 TR\'de 4h & 1d tarama aktif.')
+    telegram_send('Bot aktif! 200 yüksek hacimli çift + güncel mum spike.')
     start_scheduler()
 
     # Render için Flask
