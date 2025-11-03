@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -17,6 +18,7 @@ BASE_URL = os.getenv('BASE_URL', 'https://api.binance.com/api/v3')
 VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', '5'))
 REQUEST_SLEEP = float(os.getenv('REQUEST_SLEEP', '0.1'))
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+SERVICE_URL = os.getenv('SERVICE_URL', 'https://netbot-w3r8.onrender.com/health')
 
 if not TG_TOKEN or not TG_CHAT_ID:
     raise SystemExit('TG_TOKEN ve TG_CHAT_ID gerekli!')
@@ -28,7 +30,7 @@ app = Flask(__name__)
 
 @app.route('/health')
 def health():
-    return 'Bot alive! Güncel mum spike + 200 pair', 200
+    return 'Bot alive! gunicorn + scheduler aktif', 200
 
 def telegram_send(text):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -39,6 +41,15 @@ def telegram_send(text):
     except Exception as e:
         logger.exception('Telegram hatası: %s', e)
 
+def self_ping():
+    while True:
+        try:
+            requests.get(SERVICE_URL, timeout=10)
+            logger.debug('Self-ping OK')
+        except:
+            pass
+        time.sleep(840)
+
 def get_active_usdt_symbols():
     try:
         r = requests.get(f"{BASE_URL}/exchangeInfo", timeout=10)
@@ -46,8 +57,8 @@ def get_active_usdt_symbols():
         symbols = [s['symbol'] for s in r.json().get('symbols', [])
                    if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING']
         symbols.sort()
-        high_volume = symbols[:200]
-        logger.info(f"{len(high_volume)} yüksek hacimli USDT çifti taranıyor.")
+        high_volume = symbols[:300]  # VELOUSDT garanti
+        logger.info(f"{len(high_volume)} çift taranıyor.")
         return high_volume
     except Exception as e:
         logger.exception('exchangeInfo hatası: %s', e)
@@ -63,22 +74,13 @@ def check_current_vs_previous_mum(symbol, interval):
 
         prev_vol = float(data[0][5])
         current_vol = float(data[1][5])
-        prev_close_time = datetime.fromtimestamp(int(data[0][6]) / 1000, tz=timezone.utc) + timedelta(hours=3)
-        current_close_time = datetime.fromtimestamp(int(data[1][6]) / 1000, tz=timezone.utc) + timedelta(hours=3)
-
         if prev_vol <= 0:
             return None
 
         ratio = current_vol / prev_vol
-
         return {
-            'symbol': symbol,
-            'interval': interval,
-            'ratio': ratio,
-            'prev_vol': prev_vol,
-            'current_vol': current_vol,
-            'prev_tr_time': prev_close_time.strftime('%H:%M %d.%m'),
-            'current_tr_time': current_close_time.strftime('%H:%M %d.%m')
+            'symbol': symbol, 'interval': interval, 'ratio': ratio,
+            'prev_vol': prev_vol, 'current_vol': current_vol
         }
     except Exception as e:
         logger.debug('Hata %s %s: %s', symbol, interval, e)
@@ -88,7 +90,8 @@ def check_current_vs_previous_mum(symbol, interval):
 
 def job():
     tr_time = datetime.now(timezone.utc) + timedelta(hours=3)
-    logger.info(f"Tarama başladı: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
+    logger.info(f"TARAMA BAŞLADI: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
+    telegram_send(f"<b>TARAMA:</b> {tr_time.strftime('%H:%M')} TR")
 
     symbols = get_active_usdt_symbols()
     alerts = []
@@ -101,29 +104,35 @@ def job():
                 if res['ratio'] >= VOLUME_MULTIPLIER:
                     alerts.append(res)
                 elif res['ratio'] > 1.5:
-                    debug_msgs.append(f"{symbol} {interval}: {res['ratio']:.2f}x (güncel)")
+                    debug_msgs.append(f"{symbol} {interval}: {res['ratio']:.2f}x")
 
     if debug_msgs:
-        telegram_send(f"<b>Debug (1.5x+ güncel):</b>\n" + "\n".join(debug_msgs[:15]))
+        telegram_send(f"<b>1.5x+:</b>\n" + "\n".join(debug_msgs[:10]))
 
     if alerts:
-        msg = f"<b>{VOLUME_MULTIPLIER}x+ GÜNCEL MUM ARTIŞI!</b>\n"
+        msg = f"<b>{VOLUME_MULTIPLIER}x+ BULUNDU!</b>\n"
         for a in alerts:
-            msg += (f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x\n"
-                    f"  Önceki: {a['prev_vol']:,.0f} | Güncel: {a['current_vol']:,.0f}\n"
-                    f"  Kapanış: {a['current_tr_time']} TR\n")
+            msg += f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x\n"
         telegram_send(msg)
     else:
-        telegram_send(f"<b>{tr_time.strftime('%H:%M')} TR:</b> 5x+ güncel artış yok.")
+        telegram_send(f"<b>{tr_time.strftime('%H:%M')}:</b> 5x+ yok.")
 
-def start_scheduler():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(job, CronTrigger(minute=5), id='scan_05')
-    scheduler.start()
-    logger.info('Scheduler aktif: Her saat :05 TR\'de güncel mum tarama.')
+# SCHEDULER HER ZAMAN ÇALIŞIR
+scheduler = BackgroundScheduler()
+scheduler.add_job(job, CronTrigger(minute=5), id='scan_05')
+scheduler.start()
+logger.info('Scheduler gunicorn ile başlatıldı!')
 
+# SELF-PING THREAD
+ping_thread = threading.Thread(target=self_ping, daemon=True)
+ping_thread.start()
+logger.info('Self-ping thread başladı.')
+
+# FLASK UYGULAMASI
 if __name__ == '__main__':
-    telegram_send('Bot aktif! 200 yüksek hacimli çift + güncel mum spike.')
-    start_scheduler()
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    # SADECE LOCAL TEST İÇİN
+    telegram_send('Bot yerel olarak başladı.')
+    app.run(host='0.0.0.0', port=5000, debug=True)
+else:
+    # GUNICORN İLE ÇALIŞIRKEN
+    telegram_send('Bot gunicorn ile başladı! Tarama her :05\'te.')
