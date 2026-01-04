@@ -2,7 +2,6 @@ import os
 import time
 import requests
 import logging
-import threading
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -18,7 +17,6 @@ BASE_URL = os.getenv('BASE_URL', 'https://api.binance.com/api/v3')
 VOLUME_MULTIPLIER = float(os.getenv('VOLUME_MULTIPLIER', '5'))
 REQUEST_SLEEP = float(os.getenv('REQUEST_SLEEP', '0.1'))
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
-SERVICE_URL = os.getenv('SERVICE_URL', 'https://netbot-w3r8.onrender.com/health')
 
 if not TG_TOKEN or not TG_CHAT_ID:
     raise SystemExit('TG_TOKEN ve TG_CHAT_ID gerekli!')
@@ -41,15 +39,6 @@ def telegram_send(text):
     except Exception as e:
         logger.exception('Telegram hatası: %s', e)
 
-def self_ping():
-    while True:
-        try:
-            requests.get(SERVICE_URL, timeout=10)
-            logger.debug('Self-ping OK')
-        except:
-            pass
-        time.sleep(840)
-
 def get_active_usdt_symbols():
     try:
         r = requests.get(f"{BASE_URL}/exchangeInfo", timeout=10)
@@ -57,9 +46,8 @@ def get_active_usdt_symbols():
         symbols = [s['symbol'] for s in r.json().get('symbols', [])
                    if s.get('quoteAsset') == 'USDT' and s.get('status') == 'TRADING']
         symbols.sort()
-        high_volume = symbols[:300]  # VELOUSDT garanti
-        logger.info(f"{len(high_volume)} çift taranıyor.")
-        return high_volume
+        logger.info(f"{len(symbols)} USDT çifti bulundu.")
+        return symbols
     except Exception as e:
         logger.exception('exchangeInfo hatası: %s', e)
         return []
@@ -71,12 +59,10 @@ def check_current_vs_previous_mum(symbol, interval):
         data = r.json()
         if len(data) < 2:
             return None
-
         prev_vol = float(data[0][5])
         current_vol = float(data[1][5])
         if prev_vol <= 0:
             return None
-
         ratio = current_vol / prev_vol
         return {
             'symbol': symbol, 'interval': interval, 'ratio': ratio,
@@ -88,51 +74,57 @@ def check_current_vs_previous_mum(symbol, interval):
     finally:
         time.sleep(REQUEST_SLEEP)
 
-def job():
+def job_4h():
     tr_time = datetime.now(timezone.utc) + timedelta(hours=3)
-    logger.info(f"TARAMA BAŞLADI: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
-    telegram_send(f"<b>TARAMA:</b> {tr_time.strftime('%H:%M')} TR")
-
+    logger.info(f"4h TARAMA BAŞLADI: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
+    telegram_send(f"<b>4h TARAMA:</b> {tr_time.strftime('%H:%M')} TR")
     symbols = get_active_usdt_symbols()
     alerts = []
     debug_msgs = []
-
     for symbol in symbols:
-        for interval in ('4h', '1d'):
-            res = check_current_vs_previous_mum(symbol, interval)
-            if res:
-                if res['ratio'] >= VOLUME_MULTIPLIER:
-                    alerts.append(res)
-                elif res['ratio'] > 1.5:
-                    debug_msgs.append(f"{symbol} {interval}: {res['ratio']:.2f}x")
-
+        res = check_current_vs_previous_mum(symbol, '4h')
+        if res:
+            if res['ratio'] >= VOLUME_MULTIPLIER:
+                alerts.append(res)
+            elif res['ratio'] > 1.5:
+                debug_msgs.append(f"{symbol} 4h: {res['ratio']:.2f}x")
     if debug_msgs:
-        telegram_send(f"<b>1.5x+:</b>\n" + "\n".join(debug_msgs[:10]))
-
+        telegram_send(f"<b>1.5x+ (4h):</b>\n" + "\n".join(debug_msgs[:10]))
     if alerts:
-        msg = f"<b>{VOLUME_MULTIPLIER}x+ BULUNDU!</b>\n"
+        msg = f"<b>{VOLUME_MULTIPLIER}x+ BULUNDU (4h)!</b>\n"
         for a in alerts:
-            msg += f"• <code>{a['symbol']}</code> {a['interval']}: {a['ratio']:.1f}x\n"
+            msg += f"• <code>{a['symbol']}</code> 4h: {a['ratio']:.1f}x\n"
         telegram_send(msg)
     else:
-        telegram_send(f"<b>{tr_time.strftime('%H:%M')}:</b> 5x+ yok.")
+        telegram_send(f"<b>{tr_time.strftime('%H:%M')} (4h):</b> 5x+ yok.")
 
-# SCHEDULER HER ZAMAN ÇALIŞIR
+def job_1d():
+    tr_time = datetime.now(timezone.utc) + timedelta(hours=3)
+    logger.info(f"1d TARAMA BAŞLADI: {tr_time.strftime('%H:%M %d.%m.%Y')} TR")
+    telegram_send(f"<b>1d TARAMA:</b> {tr_time.strftime('%H:%M')} TR")
+    symbols = get_active_usdt_symbols()
+    alerts = []
+    for symbol in symbols:
+        res = check_current_vs_previous_mum(symbol, '1d')
+        if res and res['ratio'] >= VOLUME_MULTIPLIER:
+            alerts.append(res)
+    if alerts:
+        msg = f"<b>{VOLUME_MULTIPLIER}x+ BULUNDU (1d)!</b>\n"
+        for a in alerts:
+            msg += f"• <code>{a['symbol']}</code> 1d: {a['ratio']:.1f}x\n"
+        telegram_send(msg)
+    else:
+        telegram_send(f"<b>{tr_time.strftime('%H:%M')} (1d):</b> 5x+ yok.")
+
+# Scheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(job, CronTrigger(minute=5), id='scan_05')
+scheduler.add_job(job_4h, CronTrigger(minute=5, hour='*/4'))  # 4h: TR 03:05, 07:05, 11:05, 15:05, 19:05, 23:05
+scheduler.add_job(job_1d, CronTrigger(minute=5, hour=0))      # 1d: TR 03:05
 scheduler.start()
-logger.info('Scheduler gunicorn ile başlatıldı!')
+logger.info('Scheduler başladı: 4h -> */4:05, 1d -> 00:05 UTC')
 
-# SELF-PING THREAD
-ping_thread = threading.Thread(target=self_ping, daemon=True)
-ping_thread.start()
-logger.info('Self-ping thread başladı.')
-
-# FLASK UYGULAMASI
 if __name__ == '__main__':
-    # SADECE LOCAL TEST İÇİN
     telegram_send('Bot yerel olarak başladı.')
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
 else:
-    # GUNICORN İLE ÇALIŞIRKEN
-    telegram_send('Bot gunicorn ile başladı! Tarama her :05\'te.')
+    telegram_send('Bot Render’da başladı! Tarama 4h ve 1d mum kapanışlarında.')
